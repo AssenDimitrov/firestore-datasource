@@ -13,6 +13,7 @@ export const DEFAULT_QUERY: Partial<FirestoreQuery> = {
 export interface MyDataSourceOptions extends DataSourceJsonData {
   projectId: string;
   serviceAccount: string;
+  databaseName: string; // New field for custom database name
 }
 
 /**

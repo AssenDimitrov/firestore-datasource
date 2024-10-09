@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"strings"
+	
 
 	"cloud.google.com/go/firestore"
 	vkit "cloud.google.com/go/firestore/apiv1"
@@ -19,51 +21,29 @@ import (
 	"google.golang.org/api/option"
 )
 
-// Make sure Datasource implements required interfaces. This is important to do
-// since otherwise we will only get a not implemented error response from plugin in
-// runtime. In this example datasource instance implements backend.QueryDataHandler,
-// backend.CheckHealthHandler interfaces. Plugin should not implement all these
-// interfaces- only those which are required for a particular task.
 var (
 	_ backend.QueryDataHandler      = (*Datasource)(nil)
 	_ backend.CheckHealthHandler    = (*Datasource)(nil)
 	_ instancemgmt.InstanceDisposer = (*Datasource)(nil)
 )
 
-// NewDatasource creates a new datasource instance.
 func NewDatasource(_ backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
 	return &Datasource{}, nil
 }
 
-// Datasource is an example datasource which can respond to data queries, reports
-// its health and has streaming skills.
 type Datasource struct{}
 
-// Dispose here tells plugin SDK that plugin wants to clean up resources when a new instance
-// created. As soon as datasource settings change detected by SDK old datasource instance will
-// be disposed and a new one will be created using NewSampleDatasource factory function.
 func (d *Datasource) Dispose() {
 	// Clean up datasource instance resources.
 }
 
-// QueryData handles multiple queries and returns multiple responses.
-// req contains the queries []DataQuery (where each query contains RefID as a unique identifier).
-// The QueryDataResponse contains a map of RefID to the response for each query, and each response
-// contains Frames ([]*Frame).
 func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
-	// when logging at a non-Debug level, make sure you don't include sensitive information in the message
-	// (like the *backend.QueryDataRequest)
 	log.DefaultLogger.Debug("QueryData called", "numQueries", len(req.Queries))
 
-	// create response struct
 	response := backend.NewQueryDataResponse()
 
-	// loop over queries and execute them individually.
 	for _, q := range req.Queries {
 		res := d.query(ctx, req.PluginContext, q)
-
-		// save the response in a hashmap
-		// based on with RefID as identifier
 		response.Responses[q.RefID] = res
 	}
 
@@ -75,7 +55,8 @@ type FirestoreQuery struct {
 }
 
 type FirestoreSettings struct {
-	ProjectId string
+	ProjectId    string
+	DatabaseName string
 }
 
 func (d *Datasource) query(ctx context.Context, pCtx backend.PluginContext, query backend.DataQuery) (response backend.DataResponse) {
@@ -88,6 +69,9 @@ func (d *Datasource) query(ctx context.Context, pCtx backend.PluginContext, quer
 	response = d.queryInternal(ctx, pCtx, query)
 	return response
 }
+
+
+////////////////////////////////////
 
 func (d *Datasource) queryInternal(ctx context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
 	var response backend.DataResponse
@@ -116,6 +100,10 @@ func (d *Datasource) queryInternal(ctx context.Context, pCtx backend.PluginConte
 		options = append(options, fireql.OptionServiceAccount(pCtx.DataSourceInstanceSettings.DecryptedSecureJSONData["serviceAccount"]))
 	}
 
+	if settings.DatabaseName != "" {
+		options = append(options, fireql.OptionDatabaseName(settings.DatabaseName))
+	}
+
 	fQuery, err := fireql.New(settings.ProjectId, options...)
 	if err != nil {
 		return backend.ErrDataResponse(backend.StatusBadRequest, "fireql.NewFireQL: "+err.Error())
@@ -124,94 +112,167 @@ func (d *Datasource) queryInternal(ctx context.Context, pCtx backend.PluginConte
 	log.DefaultLogger.Info("Created fireql.NewFireQLWithServiceAccountJSON")
 
 	if len(qm.Query) > 0 {
-
 		log.DefaultLogger.Info("Executing query", qm.Query)
 		result, err := fQuery.Execute(qm.Query)
 		if err != nil {
 			return backend.ErrDataResponse(backend.StatusBadRequest, "fireql.Execute: "+err.Error())
 		}
 
-		fieldValues := make(map[string]interface{})
-
-		for idx, column := range result.Columns {
-			var values interface{}
-			if len(result.Records) > 0 {
-				for _, record := range result.Records {
-					val := record[idx]
-					switch val.(type) {
-					case bool:
-						if values == nil {
-							values = []bool{}
-						}
-						values = append(values.([]bool), val.(bool))
-						break
-					case int:
-						if values == nil {
-							values = []int32{}
-						}
-						values = append(values.([]int32), int32(val.(int)))
-						break
-					case int32:
-						if values == nil {
-							values = []int32{}
-						}
-						values = append(values.([]int32), val.(int32))
-						break
-					case int64:
-						if values == nil {
-							values = []int64{}
-						}
-						values = append(values.([]int64), val.(int64))
-						break
-					case float64:
-						if values == nil {
-							values = []float64{}
-						}
-						values = append(values.([]float64), val.(float64))
-						break
-					case time.Time:
-						if values == nil {
-							values = []time.Time{}
-						}
-						values = append(values.([]time.Time), val.(time.Time))
-						break
-					case map[string]interface{}, []map[string]interface{}, []interface{}:
-						if values == nil {
-							values = []json.RawMessage{}
-						}
-						jsonVal, err := json.Marshal(val)
-						if err != nil {
-							return backend.ErrDataResponse(backend.StatusBadRequest, "json.Marshal : "+column+err.Error())
-						} else {
-							values = append(values.([]json.RawMessage), json.RawMessage(jsonVal))
-						}
-						break
-					default:
-						if values == nil {
-							values = []string{}
-						}
-						values = append(values.([]string), fmt.Sprintf("%v", val))
-					}
-				}
-			} else {
-				values = []string{}
-			}
-			fieldValues[column] = values
-		}
-
-		// create data frame response.
+		// Create data frame response
 		frame := data.NewFrame("response")
-		for _, column := range result.Columns {
-			frame.Fields = append(frame.Fields,
-				data.NewField(column, nil, fieldValues[column]),
-			)
+
+		// Add a new column for document ID
+		docIDField := data.NewField("__document_id", nil, make([]*string, len(result.Records)))
+		frame.Fields = append(frame.Fields, docIDField)
+
+		// Determine the maximum number of fields across all records
+		maxFields := 0
+		for _, record := range result.Records {
+			if len(record) > maxFields {
+				maxFields = len(record)
+			}
 		}
-		// add the frames to the response.
+
+		// Create fields with nil values for missing fields
+		for i := 0; i < maxFields; i++ {
+			var fieldName string
+			if i < len(result.Columns) {
+				fieldName = result.Columns[i]
+			} else {
+				fieldName = fmt.Sprintf("field_%d", i+1)
+			}
+
+			field := data.NewField(fieldName, nil, make([]*string, len(result.Records)))
+			frame.Fields = append(frame.Fields, field)
+		}
+
+		// Populate field values for each record
+		for rowIdx, record := range result.Records {
+			// Extract document ID
+			var docID string
+			for colIdx, value := range record {
+				if colIdx < len(result.Columns) && strings.ToLower(result.Columns[colIdx]) == "__name__" {
+					if strValue, ok := value.(string); ok {
+						parts := strings.Split(strValue, "/")
+						docID = parts[len(parts)-1]
+					}
+					break
+				}
+			}
+			frame.Fields[0].Set(rowIdx, &docID)
+
+			for colIdx := 0; colIdx < maxFields; colIdx++ {
+				fieldIdx := colIdx + 1 // +1 because we added the document ID field
+				if colIdx < len(record) {
+					value := record[colIdx]
+					if timeValue, ok := value.(time.Time); ok {
+						// Convert time.Time to a string representation
+						strValue := timeValue.Format(time.RFC3339)
+						frame.Fields[fieldIdx].Set(rowIdx, &strValue)
+					} else if strValue, ok := value.(string); ok {
+						frame.Fields[fieldIdx].Set(rowIdx, &strValue)
+					} else {
+						// Convert other types to string representation
+						strValue := fmt.Sprintf("%v", value)
+						frame.Fields[fieldIdx].Set(rowIdx, &strValue)
+					}
+				} else {
+					frame.Fields[fieldIdx].Set(rowIdx, nil)
+				}
+			}
+		}
+
+		// Add the frame to the response
 		response.Frames = append(response.Frames, frame)
 	}
 
 	return response
 }
+
+//////////////////////////////////
+
+func createTypedField(name string, values []interface{}, length int) (*data.Field, error) {
+	if len(values) == 0 {
+		return data.NewField(name, nil, make([]string, length)), nil
+	}
+
+	var (
+		boolVals   = make([]*bool, length)
+		intVals    = make([]*int64, length)
+		floatVals  = make([]*float64, length)
+		stringVals = make([]*string, length)
+		timeVals   = make([]*time.Time, length)
+	)
+
+	allBool := true
+	allInt := true
+	allFloat := true
+	allTime := true
+
+	for i := 0; i < length; i++ {
+		if i >= len(values) {
+			// Handle case when i is out of range for values
+			break
+		}
+
+		v := values[i]
+		switch val := v.(type) {
+		case bool:
+			boolVals[i] = &val
+		case int, int32, int64:
+			intVal := val.(int64) // Type assertion to int64
+			intVals[i] = &intVal
+		case float32, float64:
+			floatVal := val.(float64) // Type assertion to float64
+			floatVals[i] = &floatVal
+			allInt = false
+		case string:
+			stringVals[i] = &val
+			allBool = false
+			allInt = false
+			allFloat = false
+			allTime = false
+		case time.Time:
+			timeVals[i] = &val
+			allBool = false
+			allInt = false
+			allFloat = false
+		case nil:
+			// Handle null values
+		default:
+			// For complex types, convert to JSON string
+			jsonVal, err := json.Marshal(val)
+			if err != nil {
+				return nil, fmt.Errorf("error marshaling value to JSON: %v", err)
+			}
+			strVal := string(jsonVal)
+			stringVals[i] = &strVal
+			allBool = false
+			allInt = false
+			allFloat = false
+			allTime = false
+		}
+	}
+
+	if allBool {
+		return data.NewField(name, nil, boolVals), nil
+	}
+	if allInt {
+		return data.NewField(name, nil, intVals), nil
+	}
+	if allFloat {
+		return data.NewField(name, nil, floatVals), nil
+	}
+	if allTime {
+		return data.NewField(name, nil, timeVals), nil
+	}
+
+	return data.NewField(name, nil, stringVals), nil
+}
+
+
+
+///////////////////////////////////////////
 
 func newFirestoreClient(ctx context.Context, pCtx backend.PluginContext) (*firestore.Client, error) {
 	var settings FirestoreSettings
@@ -241,7 +302,9 @@ func newFirestoreClient(ctx context.Context, pCtx backend.PluginContext) (*fires
 		}
 		options = append(options, option.WithCredentials(creds))
 	}
-	client, err := firestore.NewClient(ctx, settings.ProjectId, options...)
+
+	client, err := firestore.NewClientWithDatabase(ctx, settings.ProjectId, settings.DatabaseName, options...)
+
 	if err != nil {
 		log.DefaultLogger.Error("firestore.NewClient ", err)
 		return nil, fmt.Errorf("firestore.NewClient: %v", err)
@@ -249,13 +312,7 @@ func newFirestoreClient(ctx context.Context, pCtx backend.PluginContext) (*fires
 	return client, nil
 }
 
-// CheckHealth handles health checks sent from Grafana to the plugin.
-// The main use case for these health checks is the test button on the
-// datasource configuration page which allows users to verify that
-// a datasource is working as expected.
 func (d *Datasource) CheckHealth(ctx context.Context, req *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
-	// when logging at a non-Debug level, make sure you don't include sensitive information in the message
-	// (like the *backend.QueryDataRequest)
 	log.DefaultLogger.Debug("CheckHealth called")
 
 	var status = backend.HealthStatusOk

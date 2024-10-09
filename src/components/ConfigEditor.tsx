@@ -14,9 +14,16 @@ export class ConfigEditor extends PureComponent<Props, State> {
       ...options.jsonData,
       projectId: event.target.value.trim(),
     };
-    onOptionsChange({
-      ...options, jsonData
-    });
+    onOptionsChange({ ...options, jsonData });
+  };
+
+  onDatabaseNameChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const { onOptionsChange, options } = this.props;
+    const jsonData = {
+      ...options.jsonData,
+      databaseName: event.target.value.trim(),
+    };
+    onOptionsChange({ ...options, jsonData });
   };
 
   // Secure field (only sent to the backend)
@@ -55,14 +62,25 @@ export class ConfigEditor extends PureComponent<Props, State> {
         <div className='gf-form-group'>
           <InlineField required label="Project Id" labelWidth={20}
             tooltip="Project Id of on GCP console to fetch firestore resources.">
+            {/* @ts-ignore */}
             <Input
               onChange={this.onProjectIdChange}
               value={jsonData.projectId || ''}
               placeholder="Unique identifier for the GCP Project"
               width={40}></Input>
           </InlineField>
+          <InlineField label="Database Name" labelWidth={20}
+            tooltip="Custom database name. Leave empty for default database.">
+             {/* @ts-ignore */}
+            <Input
+              onChange={this.onDatabaseNameChange}
+              value={jsonData.databaseName || ''}
+              placeholder="(default)"
+              width={40}></Input>
+          </InlineField>
           <InlineField required label="Service Account" labelWidth={20}
             tooltip="Service Account having previliges to read all firestore resources. Least role expected is 'roles/datastore.viewer'">
+             {/* @ts-ignore */}
             <SecretTextArea
               label="Service Account"
               placeholder={`{
@@ -74,7 +92,6 @@ export class ConfigEditor extends PureComponent<Props, State> {
       ...
 }
               `}
-
               value={secureJsonData.serviceAccount || ''}
               isConfigured={(secureJsonFields && secureJsonFields.serviceAccount) as boolean}
               onReset={this.onResetServiceAccount}
@@ -84,7 +101,6 @@ export class ConfigEditor extends PureComponent<Props, State> {
             />
           </InlineField>
         </div>
-
       </div>
     );
   }
